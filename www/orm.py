@@ -14,8 +14,10 @@ def log(sql, args = ()):
 #连接池由全局变量__pool存储，缺省情况下将编码设置为utf8，自动提交事务
 async def create_pool(loop, **kw):
     logging.info('create database connection pool...')
-    global _pool
-    _pool = await aiomysql.create_pool(
+    global __pool
+    #调用一个子协程来创建全局连接池，create_pool的返回值是一个pool实例对象
+    __pool = await aiomysql.create_pool(
+            #设置连接的属性
             host = kw.get('post', 'localhost'),
             port = kw.get('port', 3306),
             user = kw['user'],
@@ -36,21 +38,24 @@ async def create_pool(loop, **kw):
 async def select(sql, args, size = None):
     log(sql, args)
     global __pool
+    #从连接池获取一条数据库连接
     async with __pool.get() as conn:
+        #打开一个DictCursor，它与普通游标的不同在于以dict形式返回结果
         async with conn.cuesor(aiomysql.DictCursor) as cur:
             await cur.execute(sql.replace('?', '%s'), args or ())
             if size:
                 rs = await cur.fetchmany(size)
             else:
                 rs = await cur.fetchall()
-        logging.info('rows returned: %s', % len(rs))
+        logging.info('rows returned: %s' % len(rs))
         return rs
 
 #Insert, Update, Delete
 #要执行INSERT、UPDATE、DELETE语句，可以定义一个通用的execute()函数，因为这3种SQL的执行都需要相同的参数，以及返回一个整数表示影响的行数：
 #execute()函数和select()函数所不同的是，cursor对象不返回结果集，而是通过rowcount返回结果数。
-def execute(sql, args, autocommit = True):
+async def execute(sql, args, autocommit = True):
     log(sql)
+    #打开一个普通游标
     async with __pool.get() as conn:
         if not autocommit:
             await conn.begin()
@@ -63,7 +68,7 @@ def execute(sql, args, autocommit = True):
                 await conn.rollback()
             raise
         return affected
-
+#构造占位符
 def create_args_string(num):
     L = []
     for n in range(num):
@@ -71,32 +76,36 @@ def create_args_string(num):
     return ', '.join(L)
 
 #定义Field以及Field各种子类
+#父域
 class Field(object):
+    #域的初始化，包括属性名、类型、是否是主键
     def __init__(self, name, column_type, primary_key, default):
         self.name = name
         self.column_type = column_type
         self.primary_key = primary_key
         self.default = default
-
+    #打印信息，依次是类名、属性类型、属性域
     def __str__(self):
         return '<%s, %s:%s>' % (self.__class__.__name__, self.column_type, self.name)
-
+#字符串域
 class StringField(Field):
+    #ddl用于定义数据类型
+    #varchar，可变长度的字符串，100表示最长长度
     def __init__(self, name = None, primary_key = False, default = None, ddl = 'varchar(100)'):
         super().__init__(name, ddl, primary_key, default)
-
+#布尔域
 class BooleanField(Field):
     def __init__(self, name = None, default = False):
         super().__init__(name, 'boolean', False, default)
-
+#整数域
 class IntegerField(Field):
     def __init__(self, name = None, primary_key = False, default = 0):
         super().__init__(name, 'bigint', primary_key, default)
-
+#浮点数域
 class FloatField(Field):
     def __init__(self, name = None, primary_key = False, default = 0.0):
         super().__init__(name, 'real', primary_key, default)
-
+#文本域
 class TextField(Field):
     def __init__(self, name = None, default = None):
         super().__init__(name, 'text', False, default)
@@ -104,28 +113,41 @@ class TextField(Field):
 #将具体的子类如User的映射信息读取出来
 class ModelMetaclass(type):
     def __new__(cls, name, bases, attrs):
-        if name == 'Model':
+        #cls：当前准备创建的类对象，相当于self
+        #name：类名，比如User继承自Model，当使用该元类创建User类时，name = User
+        #bases：父类的元组
+        #attrs：属性的字典
+        if name == 'Model':#排除Model自身，因为Model类主要就是用来被继承的，其不存在与数据库的映射
             return type.__new__(cls, name, bases, attrs)
+
+        #以下时针对“Model”的子类的处理，将被用于子类的创建，metaclass将隐式的被继承
+
+        #获取表名，若没有定义__table__属性，将类名作为表名
         tableName = attrs.get('__table__', None) or name
         logging.info('found model: %s (table: %s)' % (name, tableName))
-        mappings = dict()
-        fields = []
-        primarykey = None
+        #获取所有的Field和主键名
+        mappings = dict()#用字典来储存属性与数据库表的列的映射关系
+        fields = []#用于保存除主键以外的属性
+        primarykey = None#用于保存主键
+        #遍历类的属性，找出定义的域内的值，建立映射关系
+        #k是属性名， v是其定义域
         for k, v in attrs.items():
             if isinstance(v, Field):
                 logging.info('  found mapping: %s ==> %s' % (k, v))
-                mappings[k] = v
+                mappings[k] = v#建立映射关系
                 if v.primary_key:
                     #找到主键
-                    if primarykey:
-                        raise StandardError('Duplicate primary key for field: %s', % k)
+                    if primarykey:#若主键以存在，又找到一个主键，将报错
+                        raise StandardError('Duplicate primary key for field: %s' % k)
                     primarykey = k
                 else:
-                    fields.append(k)
-        if not primarykey:
+                    fields.append(k)#将非主键的属性加入field列表中
+        if not primarykey:#没有找到主键也报错，每张表有且仅有一个主键
             raise StandardError('Primary key not found.')
+        #从类属性中删除已加入映射字典的键，避免重名
         for k in mappings.keys():
             attrs.pop(k)
+        #将非主键的属性变形，放入escaped_fields中，方便增删改查语句的书写
         escaped_fields = list(map(lambda f: '`%s`' %f, fields))
         attrs['__mappings__'] = mappings #保存属性和列的映射关系
         attrs['__table__'] = tableName
@@ -165,4 +187,60 @@ class Model(dict, metaclass = ModelMetaclass):
         return value
 
     @classmethod
+    async def findAll(cls, where = None, args = None, **kw):
+        ' find object by where clause. '
+        sql = [cls.__select__]
+        if where:
+            sql.append('where')
+            sql.append(where)
+        if args is None:
+            args = []
+        orderBy = kw.get('orderBy', None)
+        if orderBy:
+            sql.append('oeder By')
+            sql.append(orderBy)
+        limit = kw.get('limit', None)
+        if limit is not None:
+            sql.append('limit')
+            if isinstance(limit, int):
+                sql.append('?')
+                args.append(limit)
+            elif isinstance(limit, tuple) and len(limit) == 2:
+                sql.append('?, ?')
+                args.extend(limit)
+            else:
+                raise ValueError('Invalid limit value: %s' % str(limit))
+        rs = await select(' '.join(sql), args)
+        return [cls(**r) for r in rs]
+    @classmethod
+    async def findNumber(cls, selectField, where = None, args = None):
+        ' find number by select and where. '
+        sql = ['select %s _num_ from `%s`' % (selectField, cls.__table__)]
+        if where:
+            sql.append('where')
+            sql.append(where)
+        rs = await select(' '.join(sql), args, 1)
+        if len(rs) == 0:
+            return None
+        return rs[0]['_num_']
 
+    @classmethod
+    async def find(cls, pk):
+        ' find object by primary Key. '
+        rs = await select('%s where `%s` = ?' % (cls.__select__, cls.__primary_key__), [pk], 1)
+        if len(rs) == 0:
+            return None
+        return cls(**rs[0])
+
+    async def save(self):
+        args = list(map(self.getValueOrDefault, self.__fields__))
+        args.append(self.getValueOrDefault(self.__primary_key__))
+        rows = await execute(self.__insert__, args)
+        if rows != 1:
+            logging.warn('faild to update by primary key: affected row: %s' %  rows)
+
+    async def remove(self):
+        args = [self.getValue(self.__primary_key__)]
+        rows = await execute(self.__delete__, args)
+        if rows != 1:
+            logging.warn('failed to remove by primary key: affected rows: %s' % rows)
